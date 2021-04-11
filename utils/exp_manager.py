@@ -421,6 +421,13 @@ class ExperimentManager(object):
 
             self.callbacks.append(eval_callback)
 
+        from rl.callbacks_and_wrappers import SaveObservationCallback
+        frequency = 10e5
+        sampling_factor = 10
+        obs_shape = (4, 84, 84)
+        save_obs_callback = SaveObservationCallback(self.save_path, self.algo, frequency, sampling_factor, obs_shape, verbose=1, delete=True)
+        self.callbacks.append(save_obs_callback)
+
     @staticmethod
     def is_atari(env_id: str) -> bool:
         return "AtariEnv" in gym.envs.registry.env_specs[env_id].entry_point
