@@ -71,6 +71,7 @@ class ExperimentManager(object):
         save_replay_buffer: bool = False,
         verbose: int = 1,
         vec_env_type: str = "dummy",
+        surprise = False,
     ):
         super(ExperimentManager, self).__init__()
         self.algo = algo
@@ -132,6 +133,8 @@ class ExperimentManager(object):
             self.log_path, f"{self.env_id}_{get_latest_run_id(self.log_path, self.env_id) + 1}{uuid_str}"
         )
         self.params_path = f"{self.save_path}/{self.env_id}"
+
+        self.surprise = surprise
 
     def setup_experiment(self) -> Optional[BaseAlgorithm]:
         """
@@ -425,7 +428,7 @@ class ExperimentManager(object):
         frequency = 10e5
         sampling_factor = 10
         obs_shape = (4, 84, 84)
-        save_obs_callback = SaveObservationCallback(self.save_path, self.algo, frequency, sampling_factor, obs_shape, verbose=1, delete=True)
+        save_obs_callback = SaveObservationCallback(self.save_path, self.algo, frequency, sampling_factor, obs_shape, verbose=1, delete=not self.surprise)
         self.callbacks.append(save_obs_callback)
 
     @staticmethod

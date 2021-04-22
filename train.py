@@ -89,6 +89,9 @@ if __name__ == "__main__":  # noqa: C901
         help="Overwrite hyperparameter (e.g. learning_rate:0.01 train_freq:10)",
     )
     parser.add_argument("-uuid", "--uuid", action="store_true", default=False, help="Ensure that the run has a unique ID")
+    parser.add_argument(
+        "-surprise", "--surprise", action="store_true", default=False, help="Run surprise"
+    )
     args = parser.parse_args()
 
     # Going through custom gym packages to let them register in the global registory
@@ -157,14 +160,18 @@ if __name__ == "__main__":  # noqa: C901
         save_replay_buffer=args.save_replay_buffer,
         verbose=args.verbose,
         vec_env_type=args.vec_env,
+        surprise=args.surprise,
     )
 
     # Prepare experiment and launch hyperparameter optimization if needed
     model = exp_manager.setup_experiment()
 
-    # Normal training
-    if model is not None:
-        exp_manager.learn(model)
-        exp_manager.save_trained_model(model)
+    if args.surprise:
+        pass
     else:
-        exp_manager.hyperparameters_optimization()
+        # Normal training
+        if model is not None:
+            exp_manager.learn(model)
+            exp_manager.save_trained_model(model)
+        else:
+            exp_manager.hyperparameters_optimization()
