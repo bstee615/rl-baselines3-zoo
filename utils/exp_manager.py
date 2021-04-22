@@ -422,10 +422,10 @@ class ExperimentManager(object):
             self.callbacks.append(eval_callback)
 
         from rl.callbacks_and_wrappers import SaveObservationCallback
-        frequency = 10e5
-        sampling_factor = 10
+        frequency = 1e5
+        sampling_factor = 16
         obs_shape = (4, 84, 84)
-        save_obs_callback = SaveObservationCallback(self.save_path, self.algo, frequency, sampling_factor, obs_shape, verbose=1, delete=True)
+        save_obs_callback = SaveObservationCallback(self.algo, self.save_path, frequency, sampling_factor, obs_shape, verbose=1, delete=True)
         self.callbacks.append(save_obs_callback)
 
     @staticmethod
