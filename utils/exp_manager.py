@@ -428,7 +428,7 @@ class ExperimentManager(object):
         frequency = 10e5
         sampling_factor = 10
         obs_shape = (4, 84, 84)
-        save_obs_callback = SaveObservationCallback(self.save_path, self.algo, frequency, sampling_factor, obs_shape, verbose=1, delete=not self.surprise)
+        save_obs_callback = SaveObservationCallback(self.algo, self.save_path, frequency, sampling_factor, obs_shape, verbose=1, delete=not self.surprise)
         self.callbacks.append(save_obs_callback)
 
     @staticmethod
