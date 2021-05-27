@@ -1,14 +1,22 @@
 import argparse
 import importlib
 import os
+import random
 import sys
 
 import numpy as np
 import torch as th
+import pandas as pd
+import seaborn as sns
 import yaml
+from sklearn.model_selection import train_test_split
+from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 from stable_baselines3.common.utils import set_random_seed
 
 import utils.import_envs  # noqa: F401 pylint: disable=unused-import
+from len_gen import BatchTqdm
 from utils import ALGOS, create_test_env, get_latest_run_id, get_saved_hyperparams
 from utils.exp_manager import ExperimentManager
 from utils.utils import StoreDict
@@ -23,6 +31,7 @@ from tqdm import tqdm
 from rl.callbacks_and_wrappers import SaveObservationCallback
 from rl.eval import get_activations, do_lsa, plot_it
 from sa import process_ats
+from surprise_adequacy.surprise.surprise_adequacy import SurpriseAdequacyConfig, LSA
 
 
 def attack(model, obs, eps):
@@ -39,11 +48,13 @@ def attack(model, obs, eps):
 
     attack_succeeded = []
     adv_obs = []
+    # if isinstance(obs, np.ndarray):
+    #     obs = torch.from_numpy(obs)
     obs = torch.tensor(obs).float()
     for batch in obs.split(1024):
         batch = batch.cuda()
         fgsm = GradientSignAttack(
-            predict=predict, eps=eps*4,
+            predict=predict, eps=eps*255,
             clip_min=0, clip_max=255, targeted=True)
         original_action, _, _ = net(batch)
 
@@ -52,34 +63,42 @@ def attack(model, obs, eps):
 
         attack_succeeded.append(original_action.eq(adv_action).cpu().numpy())
         adv_obs.append(adv_batch.cpu().int().numpy())
-    plt.imshow(np.concatenate(batch[0].cpu().int().numpy()), cmap='gray')
-    plt.show()
-    plt.imshow(np.concatenate(adv_batch[0].cpu().int().numpy()), cmap='gray')
-    plt.show()
+    # plt.imshow(np.concatenate(batch[0].cpu().int().numpy()), cmap='gray')
+    # plt.title(f'benign')
+    # plt.show()
+    # plt.imshow(np.concatenate(adv_batch[0].cpu().int().numpy()), cmap='gray')
+    # plt.title(f'$\\epsilon = {eps}$')
+    # plt.show()
     attack_succeeded = np.concatenate(attack_succeeded)
     adv_obs = np.concatenate(adv_obs)
 
     return adv_obs, attack_succeeded
 
 
-def do_surprise(model, log_dir):
+def do_surprise(model, sa, log_dir, layer, eps):
     log_dir = Path(log_dir)
-    obs_pkl = log_dir / 'train' / 'obs.npy'
-    save_dir = log_dir / 'save'
-    layers = ['cnn.3']
-    if Path(save_dir / 'train_ats.npy').exists():
-        train_ats = np.load(str(save_dir / 'train_ats.npy'))
-        train_preds = np.load(str(save_dir / 'train_preds.npy'))
+    lsa_dir = log_dir / 'lsa'
+    lsa_dir.mkdir(exist_ok=True)
+    if eps is None:
+        target = 'test'
     else:
-        train_obs, num_train_obs = SaveObservationCallback.load(obs_pkl)
-        train_activations, train_preds = get_activations(model.policy, layers, train_obs, num_train_obs)
-        np.save(str(save_dir / 'train_activations.npy'), train_activations)
-        np.save(str(save_dir / 'train_preds.npy'), train_preds)
-        train_ats = process_ats(train_activations, num_proc=3)
-        np.save(str(save_dir / 'train_ats.npy'), train_ats)
+        target = f'fgsm_{eps}'
 
-    if Path(save_dir / 'test_obs.npy').exists():
-        test_obs = np.load(str(save_dir / 'test_obs.npy'))
+    sa.config = SurpriseAdequacyConfig(saved_path=lsa_dir, is_classification=True, layer_names=[layer],
+                                       ds_name='pong', num_classes=6)
+    # if Path(train_dir / 'ats.npy').exists():
+    #     train_ats = np.load(str(train_dir / 'ats.npy'))
+    #     train_preds = np.load(str(train_dir / 'preds.npy'))
+    # else:
+    #     train_obs, num_train_obs = SaveObservationCallback.load(obs_pkl)
+    #     train_activations, train_preds = get_activations(model.policy, [layer], train_obs, num_train_obs)
+    #     np.save(str(train_dir / 'activations.npy'), train_activations)
+    #     np.save(str(train_dir / 'preds.npy'), train_preds)
+    #     train_ats = process_ats(train_activations, num_proc=3)
+    #     np.save(str(train_dir / 'ats.npy'), train_ats)
+
+    if Path(lsa_dir / 'test_obs.npy').exists():
+        test_obs = np.load(str(lsa_dir / 'test_obs.npy'))
     else:
         env = model.env
         print('Gathering observations from environment')
@@ -98,44 +117,52 @@ def do_surprise(model, log_dir):
             obs_collected += len(obs)
             pbar.update(len(obs))
         pbar.close()
-        print(f'Mean reward: {np.mean(episode_rewards):.2f}+={np.std(episode_rewards)}:.2f')
+        print(f'Mean reward: {np.mean(episode_rewards):.2f}+-{np.std(episode_rewards):.2f}')
         test_obs = np.concatenate(test_obs)
-        np.save(str(save_dir / 'test_obs.npy'), test_obs)
+        np.save(str(lsa_dir / 'test_obs.npy'), test_obs)
 
-    eps = 1.0
-    # target = f'fgsm_{eps}'
-    target = 'test'
-    adv_obs, adv_success = attack(model, test_obs, eps)
-    print(f'Epsilon: {eps}, attacks succeeded: {np.sum(adv_success) / len(adv_success) * 100:.2f}%')
-    if 'fgsm' in target:
-        target_obs = adv_obs
-    else:
+    if eps is None:
         target_obs = test_obs
-
-    if Path(save_dir / f'{target}_ats.npy').exists():
-        target_preds = np.load(str(save_dir / f'{target}_preds.npy'))
-        target_ats = np.load(str(save_dir / f'{target}_ats.npy'))
     else:
-        num_target_obs = len(target_obs)
-        target_obs = np.array_split(target_obs, len(target_obs) // 256)
-        target_activations, target_preds = get_activations(model.policy, layers, target_obs, num_target_obs)
-        np.save(str(save_dir / f'{target}_activations.npy'), target_activations)
-        np.save(str(save_dir / f'{target}_preds.npy'), target_preds)
-        target_ats = process_ats(target_activations)
-        np.save(str(save_dir / f'{target}_ats.npy'), target_ats)
+        adv_obs, adv_success = attack(model, test_obs, eps)
+        print(f'Epsilon: {eps}, attacks succeeded: {np.sum(adv_success) / len(adv_success) * 100:.2f}%')
+        target_obs = adv_obs
 
-    if Path(save_dir / f'{target}_lsa.npy').exists():
-        lsa = np.load(str(save_dir / f'{target}_lsa.npy'))
+    # if Path(target_dir / f'ats.npy').exists():
+    #     target_preds = np.load(str(target_dir / f'preds.npy'))
+    #     target_ats = np.load(str(target_dir / f'ats.npy'))
+    # else:
+    #     num_target_obs = len(target_obs)
+    #     target_obs = np.array_split(target_obs, len(target_obs) // 256)
+    #     target_activations, target_preds = get_activations(model.policy, [layer], target_obs, num_target_obs)
+    #     np.save(str(target_dir / f'activations.npy'), target_activations)
+    #     np.save(str(target_dir / f'preds.npy'), target_preds)
+    #     target_ats = process_ats(target_activations)
+    #     np.save(str(target_dir / f'ats.npy'), target_ats)
+    if not Path(lsa_dir / f'lsa_{layer}_{target}.npy').exists():
+        sa.prep(use_cache=True)
+        lsa, pred = sa.calc(
+            BatchTqdm(iter(np.array_split(target_obs, len(target_obs) // 256)), len(target_obs)),
+            ds_type=target,
+            use_cache=True
+        )
+
+        np.save(str(lsa_dir / f'lsa_{layer}_{target}.npy'), lsa)
     else:
-        my_args = SimpleNamespace()
-        my_args.var_threshold = 1e-5
-        my_args.num_classes = model.env.action_space.n
-        my_args.is_classification = True
-        lsa = do_lsa(my_args, train_ats, train_preds, target_ats, target_preds)
-        np.save(str(save_dir / f'{target}_lsa.npy'), lsa)
-    print(train_ats.shape, target_ats.shape, len(lsa))
+        lsa = np.load(str(lsa_dir / f'lsa_{layer}_{target}.npy'))
 
-    plot_it(log_dir / 'plots', layers, eps, target, lsa)
+    # if Path(target_dir / f'lsa.npy').exists():
+    #     lsa = np.load(str(target_dir / f'lsa.npy'))
+    # else:
+    #     my_args = SimpleNamespace()
+    #     my_args.var_threshold = 1e-5
+    #     my_args.num_classes = model.env.action_space.n
+    #     my_args.is_classification = True
+    #     # lsa = do_lsa(my_args, train_ats, train_preds, target_ats, target_preds)
+    #     np.save(str(save_dir / f'{target}_lsa.npy'), lsa)
+    # print(train_ats.shape, target_ats.shape, len(lsa))
+
+    plot_it(log_dir / 'plots', layer, eps, target, lsa)
 
 
 def main():  # noqa: C901
@@ -176,6 +203,15 @@ def main():  # noqa: C901
     )
     parser.add_argument(
         "--env-kwargs", type=str, nargs="+", action=StoreDict, help="Optional keyword argument to pass to the env constructor"
+    )
+    parser.add_argument(
+        "--surprise", action="store_true", default=False, help="Evaluate surprise"
+    )
+    parser.add_argument(
+        "--attack", action="store_true", default=False, help="Do adversarial attack"
+    )
+    parser.add_argument(
+        "--sequence", action="store_true", default=False, help="Evaluate sequence of surprise"
     )
     args = parser.parse_args()
 
@@ -278,73 +314,209 @@ def main():  # noqa: C901
 
     model = ALGOS[algo].load(model_path, env=env, custom_objects=custom_objects, **kwargs)
 
-    do_surprise(model, log_path)
+    log_dir = Path(log_path)
+    if args.surprise:
+        obs_pkl = log_dir / 'train' / 'obs.npy'
+        train_obs = SaveObservationCallback.load(obs_pkl)
+        all_layers = ['features_extractor.cnn.3', 'features_extractor.cnn.5', 'features_extractor.linear.1']
+        # all_layers = ['features_extractor.cnn.5', 'features_extractor.linear.1']
+        # all_layers = ['features_extractor.linear.1']
 
-    # obs = env.reset()
-    #
-    # # Deterministic by default except for atari games
-    # stochastic = args.stochastic or is_atari and not args.deterministic
-    # deterministic = not stochastic
-    #
-    # state = None
-    # episode_reward = 0.0
-    # episode_rewards, episode_lengths = [], []
-    # ep_len = 0
-    # # For HER, monitor success rate
-    # successes = []
-    # try:
-    #     for _ in range(args.n_timesteps):
-    #         action, state = model.predict(obs, state=state, deterministic=deterministic)
-    #         obs, reward, done, infos = env.step(action)
-    #         if not args.no_render:
-    #             env.render("human")
-    #
-    #         episode_reward += reward[0]
-    #         ep_len += 1
-    #
-    #         if args.n_envs == 1:
-    #             # For atari the return reward is not the atari score
-    #             # so we have to get it from the infos dict
-    #             if is_atari and infos is not None and args.verbose >= 1:
-    #                 episode_infos = infos[0].get("episode")
-    #                 if episode_infos is not None:
-    #                     print(f"Atari Episode Score: {episode_infos['r']:.2f}")
-    #                     print("Atari Episode Length", episode_infos["l"])
-    #
-    #             if done and not is_atari and args.verbose > 0:
-    #                 # NOTE: for env using VecNormalize, the mean reward
-    #                 # is a normalized reward when `--norm_reward` flag is passed
-    #                 print(f"Episode Reward: {episode_reward:.2f}")
-    #                 print("Episode Length", ep_len)
-    #                 episode_rewards.append(episode_reward)
-    #                 episode_lengths.append(ep_len)
-    #                 episode_reward = 0.0
-    #                 ep_len = 0
-    #                 state = None
-    #
-    #             # Reset also when the goal is achieved when using HER
-    #             if done and infos[0].get("is_success") is not None:
-    #                 if args.verbose > 1:
-    #                     print("Success?", infos[0].get("is_success", False))
-    #
-    #                 if infos[0].get("is_success") is not None:
-    #                     successes.append(infos[0].get("is_success", False))
-    #                     episode_reward, ep_len = 0.0, 0
-    #
-    # except KeyboardInterrupt:
-    #     pass
-    #
-    # if args.verbose > 0 and len(successes) > 0:
-    #     print(f"Success rate: {100 * np.mean(successes):.2f}%")
-    #
-    # if args.verbose > 0 and len(episode_rewards) > 0:
-    #     print(f"{len(episode_rewards)} Episodes")
-    #     print(f"Mean reward: {np.mean(episode_rewards):.2f} +/- {np.std(episode_rewards):.2f}")
-    #
-    # if args.verbose > 0 and len(episode_lengths) > 0:
-    #     print(f"Mean episode length: {np.mean(episode_lengths):.2f} +/- {np.std(episode_lengths):.2f}")
-    #
-    # env.close()
+        # epsilons = [None, 0.01, 0.1, 0.5, 1.0]
+        epsilons = [0.001, 0.005]
+
+        for layer in all_layers:
+            sa_config = SurpriseAdequacyConfig(saved_path=log_dir / 'lsa', is_classification=True, layer_names=[layer],
+                                               ds_name='pong', num_classes=6)
+            sa = LSA(model.policy, train_obs, sa_config)
+            sa.prep(use_cache=True)
+            for eps in epsilons:
+            # for eps in [0.5]:
+                    do_surprise(model, sa, log_path, layer, eps)
+    if args.attack:
+        def rollout(model, env, n_obs, eps, prob_attack, render=False):
+            obs_collected = 0
+            obs = env.reset()
+            pbar = tqdm(total=n_obs)
+            episode_rewards = []
+            while obs_collected < n_obs:
+                if render:
+                    env.render()
+                if eps is not None:
+                    if random.random() < prob_attack:
+                        adv_obs, success = attack(model, np.transpose(obs, (0, 3, 1, 2)), eps)
+                        adv_obs = np.transpose(adv_obs, (0, 2, 3, 1))
+                        obs = adv_obs
+                action, state = model.predict(obs, deterministic=True)
+                obs, reward, done, info = env.step(action)
+                episode_rewards += [i["episode"]["r"] for i in info if "episode" in i]
+                obs_collected += len(obs)
+                pbar.update(len(obs))
+            pbar.close()
+            return episode_rewards
+        all_rewards = []
+        # epsilons = [None, 0.01, 0.1, 0.2, 0.4, 0.8, 1.0]
+        epsilons = [0.001, 0.01]
+        # probs = [0.1, 0.25, 0.5, 1.0]
+        probs = [1.0]
+        for eps in epsilons:
+            df = pd.DataFrame()
+            for p in probs:
+                print(f'Attacking the agent. Epsilon: {eps}')
+                n_obs = 1e4
+                episode_rewards = rollout(model, env, n_obs, eps, p)
+                print(f'Mean reward: {np.mean(episode_rewards):.2f}+-{np.std(episode_rewards):.2f}')
+                results = pd.DataFrame([[p, r] for r in episode_rewards], columns=['prob', 'rew'])
+                all_rewards.append(episode_rewards)
+                df = df.append(results, ignore_index=True)
+                model.env.close()
+            df.to_csv(log_dir / f'adv_attacks_{eps}.csv')
+            sns.barplot(data=df, x='prob', y='rew', ci='sd')
+            plt.title(f'Pong adversarial attack performance, $\\epsilon = {eps}$')
+            plt.show()
+    if args.sequence:
+        env = model.env
+
+        # perturb_probs = [0.01, 0.1, 0.5]
+        perturb_probs = [0.1]
+        rewards = []
+        for perturb_prob in perturb_probs:
+            epsilon = 0.01
+            n_episodes = 1
+
+            all_eps_obs = []
+            all_eps_success, all_eps_fail = [], []
+            for i in range(n_episodes):
+                eps_obs = []
+                eps_success, eps_fail = [], []
+                eps_reward = 0
+                obs = env.reset()
+                done = False
+                ts = 0
+                while not done:
+                    if random.random() < perturb_prob:
+                        obs, success = attack(model, obs, epsilon)
+                        if success[0]:
+                            eps_success.append(ts)
+                        else:
+                            eps_fail.append(ts)
+                    eps_obs.append(obs)
+                    action, state = model.predict(obs, deterministic=True)
+                    obs, reward, done, info = env.step(action)
+                    eps_reward += reward.item()
+                    ts += 1
+                    # env.render()
+                eps_obs = np.concatenate(eps_obs)
+                all_eps_obs.append(eps_obs)
+                all_eps_success.append(eps_success)
+                all_eps_fail.append(eps_fail)
+                rewards.append(eps_reward)
+            all_eps_success = np.array(all_eps_success)
+            all_eps_fail = np.array(all_eps_fail)
+            rewards = np.array(rewards)
+
+            layer = 'features_extractor.linear.1'
+            obs_pkl = log_dir / 'train' / 'obs.npy'
+            train_obs = SaveObservationCallback.load(obs_pkl)
+            sa_config = SurpriseAdequacyConfig(saved_path=log_dir / 'lsa', is_classification=True, layer_names=[layer],
+                                               ds_name='pong', num_classes=6)
+            sa = LSA(model.policy, train_obs, sa_config)
+            sa.prep(use_cache=True)
+            eps_lsa = []
+            scaler = StandardScaler()
+            for (i, eps_obs) in enumerate(all_eps_obs):
+                num_splits = len(eps_obs) // 256
+                # if num_splits == 0:
+                #     num_splits = 1
+                # batches = np.array_split(eps_obs, num_splits)
+                batches = [eps_obs]
+                lsa, pred = sa.calc(
+                    BatchTqdm(
+                        iter(batches),
+                        len(eps_obs)
+                    ), ds_type='sequence_fgsm_1.0', use_cache=False)
+                eps_lsa.append(scaler.fit_transform(lsa.reshape((-1, 1))))
+
+            # df = pd.DataFrame(data=[(i, eps, lsa) for i, (eps, lsa) in enumerate(eps_lsa)], columns=["ts", "episode", "lsa"])
+            # df = pd.melt(df, ['ts'])
+            # sns.lineplot(data=df, x='ts', y='value', hue='variable')
+            # np.save(f'lsa-seq-{args.env}.npy', eps_lsa)
+            # np.save(f'rewards-seq-{args.env}.npy', rewards)
+            # np.save(f'all_eps_success-seq-{args.env}.npy', all_eps_success)
+            # np.save(f'all_eps_fail-seq-{args.env}.npy', all_eps_fail)
+            for i, el in enumerate(eps_lsa):
+                plt.plot(range(len(el)), el, label=f'episode {i}/reward {rewards[i]}')
+                plt.scatter(all_eps_success[i], np.take(el, all_eps_success[i]), marker='o', c='g')
+                plt.scatter(all_eps_fail[i], np.take(el, all_eps_fail[i]), marker='x', c='r')
+            plt.legend(loc="upper left")
+            plt.xlabel('timestep')
+            plt.ylabel('lsa')
+            plt.title(f'{n_episodes} LSA sequences on {args.env}. $p = {perturb_prob}$, $\\epsilon = {epsilon}$')
+            plt.show()
+
+
+def detector(benign_lsa, fgsm_lsa):
+    x = np.concatenate((benign_lsa, fgsm_lsa)).reshape((-1, 1))
+    y = np.concatenate((np.zeros_like(benign_lsa), np.ones_like(fgsm_lsa)))
+    x_train, x_test, y_train, y_test = train_test_split(x, y, random_state=42)
+
+    # plt.scatter(np.array([x for i, x in enumerate(x_train) if y_train[i] == 1]), y_train[y_train == 1], c='b', marker='o')
+    # plt.scatter(np.array([x for i, x in enumerate(x_train) if y_train[i] == 0]), y_train[y_train == 0], c='r', marker='+')
+    # plt.show()
+
+    from sklearn.linear_model import LogisticRegressionCV
+    model = make_pipeline(StandardScaler(), LogisticRegressionCV(cv=10))
+    # model = LogisticRegressionCV(cv=10)
+    # model = MLPClassifier(solver='lbfgs', alpha=1e-5,
+    #                       hidden_layer_sizes=(16, 16), random_state=1,
+    #                       max_iter=1e4)
+    trained_model = model.fit(x_train, y_train)
+
+    pred = trained_model.predict(x_test)
+    tp = np.sum(np.logical_and(pred, y_test)).item()
+    fp = np.sum(np.logical_and(pred, np.logical_not(y_test))).item()
+    tn = np.sum(np.logical_and(np.logical_not(pred), np.logical_not(y_test))).item()
+    fn = np.sum(np.logical_and(np.logical_not(pred), y_test)).item()
+    return tp, fp, tn, fn
+
+
+def test_detector():
+    entries = []
+    # layer = 'features_extractor.cnn.3'
+
+    for game in ['Pong', 'SpaceInvaders']:
+        for layer in ['features_extractor.cnn.3', 'features_extractor.cnn.5', 'features_extractor.linear.1']:
+            for eps in [0.001, 0.005, 0.01, 0.1, 0.5, 1.0]:
+                # game = 'Pong'
+                # game = 'SpaceInvaders'
+                root = Path(f'D:\\weile-lab\\sadl-rl\\runs\\pronto\\results\\zoo\\ppo\\{game}NoFrameskip-v4_1\\lsa')
+                benign_lsa = np.load(root / f'lsa_{layer}_test.npy')
+                fgsm_lsa = np.load(root / f'lsa_{layer}_fgsm_{eps}.npy')
+                stats = detector(benign_lsa, fgsm_lsa)
+                # print(f'Accuracy of LR adv detector: {accuracy * 100:.2f}%')
+                entries.append((layer, eps, *stats))
+
+        df = pd.DataFrame(entries, columns=['layer', 'eps', 'tp', 'fp', 'tn', 'fn'])
+        df["precision"] = df["tp"] / (df["tp"] + df["fp"])
+        df["recall"] = df["tp"] / (df["tp"] + df["fn"])
+
+        fig, ax = plt.subplots(1, 2)
+        fig.set_size_inches(10, 6)
+        fig.suptitle(f'Precision/Recall of LR adv. detector over $\\epsilon$ - {game}NoFrameskip')
+        sns.barplot(data=df, x='eps', y='precision', hue='layer', ci=None, ax=ax[0])
+        sns.barplot(data=df, x='eps', y='recall', hue='layer', ci=None, ax=ax[1])
+        ax[0].set_title('Precision')
+        ax[0].set_ylim(0.0, 1.1)
+        ax[1].set_title('Recall')
+        ax[1].set_ylim(0.0, 1.1)
+
+        for a in ax:
+            a.legend([], [], frameon=False)
+        # handles, labels = ax[0].get_legend_handles_labels()
+        ax[1].legend(bbox_to_anchor=(1.03, 1))
+        plt.subplots_adjust(left=0.1, right=0.75, top=0.9, bottom=0.1)
+        # plt.tight_layout()
+        plt.show()
 
 
 if __name__ == "__main__":
