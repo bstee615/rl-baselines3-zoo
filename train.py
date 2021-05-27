@@ -89,6 +89,7 @@ if __name__ == "__main__":  # noqa: C901
         help="Overwrite hyperparameter (e.g. learning_rate:0.01 train_freq:10)",
     )
     parser.add_argument("-uuid", "--uuid", action="store_true", default=False, help="Ensure that the run has a unique ID")
+    parser.add_argument("--sampling_factor", type=int, default=1, help="How many observations to sample")
     args = parser.parse_args()
 
     # Going through custom gym packages to let them register in the global registory
@@ -157,6 +158,7 @@ if __name__ == "__main__":  # noqa: C901
         save_replay_buffer=args.save_replay_buffer,
         verbose=args.verbose,
         vec_env_type=args.vec_env,
+        sampling_factor=args.sampling_factor
     )
 
     # Prepare experiment and launch hyperparameter optimization if needed

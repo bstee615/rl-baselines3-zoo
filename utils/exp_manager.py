@@ -71,6 +71,7 @@ class ExperimentManager(object):
         save_replay_buffer: bool = False,
         verbose: int = 1,
         vec_env_type: str = "dummy",
+        sampling_factor: int = 1,
     ):
         super(ExperimentManager, self).__init__()
         self.algo = algo
@@ -126,6 +127,7 @@ class ExperimentManager(object):
         self.args = args
         self.log_interval = log_interval
         self.save_replay_buffer = save_replay_buffer
+        self.sampling_factor = sampling_factor
 
         self.log_path = f"{log_folder}/{self.algo}/"
         self.save_path = os.path.join(
@@ -423,7 +425,7 @@ class ExperimentManager(object):
 
         from rl.callbacks_and_wrappers import SaveObservationCallback
         frequency = 1e5
-        sampling_factor = 16
+        sampling_factor = self.sampling_factor
         obs_shape = (4, 84, 84)
         save_obs_callback = SaveObservationCallback(self.algo, self.save_path, frequency, sampling_factor, obs_shape, verbose=1, delete=True)
         self.callbacks.append(save_obs_callback)
