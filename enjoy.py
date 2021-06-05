@@ -61,7 +61,7 @@ def attack(model, obs, eps):
         adv_batch = fgsm.perturb(batch, original_action)
         adv_action, _, _ = net(adv_batch)
 
-        attack_succeeded.append(original_action.eq(adv_action).cpu().numpy())
+        attack_succeeded.append((~original_action.eq(adv_action)).cpu().numpy())
         adv_obs.append(adv_batch.cpu().int().numpy())
     # plt.imshow(np.concatenate(batch[0].cpu().int().numpy()), cmap='gray')
     # plt.title(f'benign')
@@ -314,6 +314,11 @@ def main():  # noqa: C901
 
     model = ALGOS[algo].load(model_path, env=env, custom_objects=custom_objects, **kwargs)
 
+    ts_to_load = None
+    if args.load_checkpoint:
+        # TODO: Set to sampling rate
+        ts_to_load = args.load_checkpoint // 16
+
     log_dir = Path(log_path)
     if args.surprise:
         obs_pkl = log_dir / 'train' / 'obs.npy'
@@ -377,13 +382,23 @@ def main():  # noqa: C901
     if args.sequence:
         env = model.env
 
-        # perturb_probs = [0.01, 0.1, 0.5]
-        perturb_probs = [0.1]
-        rewards = []
-        for perturb_prob in perturb_probs:
-            epsilon = 0.01
-            n_episodes = 1
+        layer = 'features_extractor.linear.1'
+        obs_pkl = log_dir / 'train' / 'obs.npy'
+        train_obs = SaveObservationCallback.load(obs_pkl, ts_to_load)
+        sa_config = SurpriseAdequacyConfig(saved_path=log_dir / 'lsa', is_classification=True, layer_names=[layer],
+                                           ds_name='pong', num_classes=6)
+        sa = LSA(model.policy, train_obs, sa_config)
+        sa.prep(use_cache=True)
 
+        # perturb_probs = [0.01, 0.1, 0.5]
+        # perturb_probs = [1.0]
+        perturb_probs = [0.0]
+        for perturb_prob in perturb_probs:
+            epsilon = 0.1
+            # n_episodes = 1
+            n_episodes = 100
+
+            rewards = []
             all_eps_obs = []
             all_eps_success, all_eps_fail = [], []
             for i in range(n_episodes):
@@ -395,11 +410,15 @@ def main():  # noqa: C901
                 ts = 0
                 while not done:
                     if random.random() < perturb_prob:
-                        obs, success = attack(model, obs, epsilon)
-                        if success[0]:
+                        # adv_obs, success = attack(model, np.transpose(obs, (0, 3, 1, 2)), epsilon)
+                        # adv_obs = np.transpose(adv_obs, (0, 2, 3, 1))
+                        adv_obs, success = attack(model, obs, epsilon)
+                        succeeded = success[0]
+                        if succeeded:
                             eps_success.append(ts)
-                        else:
-                            eps_fail.append(ts)
+                            obs = adv_obs
+                        # else:
+                        #     eps_fail.append(ts)
                     eps_obs.append(obs)
                     action, state = model.predict(obs, deterministic=True)
                     obs, reward, done, info = env.step(action)
@@ -412,20 +431,16 @@ def main():  # noqa: C901
                 all_eps_fail.append(eps_fail)
                 rewards.append(eps_reward)
             all_eps_success = np.array(all_eps_success)
-            all_eps_fail = np.array(all_eps_fail)
+            # all_eps_fail = np.array(all_eps_fail)
             rewards = np.array(rewards)
 
-            layer = 'features_extractor.linear.1'
-            obs_pkl = log_dir / 'train' / 'obs.npy'
-            train_obs = SaveObservationCallback.load(obs_pkl)
-            sa_config = SurpriseAdequacyConfig(saved_path=log_dir / 'lsa', is_classification=True, layer_names=[layer],
-                                               ds_name='pong', num_classes=6)
-            sa = LSA(model.policy, train_obs, sa_config)
-            sa.prep(use_cache=True)
+            variances = []
+            weird_idx_lens = []
+
             eps_lsa = []
             scaler = StandardScaler()
             for (i, eps_obs) in enumerate(all_eps_obs):
-                num_splits = len(eps_obs) // 256
+                # num_splits = len(eps_obs) // 256
                 # if num_splits == 0:
                 #     num_splits = 1
                 # batches = np.array_split(eps_obs, num_splits)
@@ -434,8 +449,23 @@ def main():  # noqa: C901
                     BatchTqdm(
                         iter(batches),
                         len(eps_obs)
-                    ), ds_type='sequence_fgsm_1.0', use_cache=False)
+                    ), ds_type=f'sequence_fgsm_{perturb_prob}_{epsilon}', use_cache=False)
                 eps_lsa.append(scaler.fit_transform(lsa.reshape((-1, 1))))
+
+                # Print variance stats
+                variance = np.var(lsa)
+                variances.append(variance)
+                # print('Variance:', variance)
+                from scipy import stats
+                weird_pts = np.abs(lsa - stats.mode(lsa).mode) > 0.0001
+                weird_idx = np.where(weird_pts)[0]
+                weird_idx_lens.append(len(weird_idx))
+                # print('Number of weird points:', len(weird_idx), 'difference', lsa[weird_idx] - stats.mode(lsa).mode)
+
+            print('Variance:', np.mean(variances), np.std(variances))
+            print('Number of weird points:', np.mean(weird_idx_lens), np.std(weird_idx_lens))
+
+            # return  # TODO skipping plot for now
 
             # df = pd.DataFrame(data=[(i, eps, lsa) for i, (eps, lsa) in enumerate(eps_lsa)], columns=["ts", "episode", "lsa"])
             # df = pd.melt(df, ['ts'])
@@ -446,8 +476,8 @@ def main():  # noqa: C901
             # np.save(f'all_eps_fail-seq-{args.env}.npy', all_eps_fail)
             for i, el in enumerate(eps_lsa):
                 plt.plot(range(len(el)), el, label=f'episode {i}/reward {rewards[i]}')
-                plt.scatter(all_eps_success[i], np.take(el, all_eps_success[i]), marker='o', c='g')
-                plt.scatter(all_eps_fail[i], np.take(el, all_eps_fail[i]), marker='x', c='r')
+                plt.scatter(all_eps_success[i], np.take(el.astype(np.float), all_eps_success[i].astype(np.int)), marker='o', c='g')
+                # plt.scatter(all_eps_fail[i], np.take(el, all_eps_fail[i]), marker='x', c='r')
             plt.legend(loc="upper left")
             plt.xlabel('timestep')
             plt.ylabel('lsa')
